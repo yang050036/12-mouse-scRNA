@@ -4,6 +4,7 @@ library(dplyr)
 library(clustree)
 library(clusterProfiler)
 library(CellChat)
+library(harmony)
 
 ###### standard analysis #####
 out = "result"
@@ -63,14 +64,25 @@ data.list = lapply(data.list, function(obj){
   obj = obj[, obj@meta.data[, DF.name] == "Singlet"]
   return(obj)
 })
-features = SelectIntegrationFeatures(data.list)
-data.list = lapply(data.list, function(obj){
-  obj = ScaleData(obj, features = features, verbose = FALSE)
-  obj = RunPCA(obj, features = features, verbose = FALSE)
-  return(obj)
-})
-anchors = FindIntegrationAnchors(data.list, anchor.features = features, reduction = "rpca", k.anchor = 20)
-data = IntegrateData(anchorset = anchors)
+
+## 剔除BL03重新分析
+data = subset(data, orig.ident != "BL03")
+DefaultAssay(data) = "RNA"
+
+##改用harmony去除批次效应
+s.genes <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+s.genes[which(s.genes == "Mlf1ip")] = "Cenpu"
+g2m.genes[which(g2m.genes == "Fam64a")] = "Pimreg"
+g2m.genes[which(g2m.genes == "Hn1")] = "Jpt1"
+data = CellCycleScoring(data, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+data = FindVariableFeatures(data, nfeatures = 3000)
+options(future.globals.maxSize = 3000 * 1024^2)
+data = ScaleData(data, vars.to.regress = c("S.Score", "G2M.Score"))
+data = RunPCA(data, npcs = 50)
+png("tmp/convergence.png", width = 1500, height = 1500, res = 300)
+data = RunHarmony(data, group.by.vars = "orig.ident", plot_convergence = TRUE, reduction = "pca")
+dev.off()
 #qc
 Idents(data) = "orig.ident"
 for (sample in names(data.list)){
@@ -91,32 +103,19 @@ p = VlnPlot(data, features = c("percent.mt"), pt.size = 0) + labs("percent.mito"
 ggsave(file.path(qcout, "vlnplot.mt.png"), p, bg = "white")
 ggsave(file.path(qcout, "vlnplot.mt.pdf"), p, bg = "white")
 
-#data = merge(data.list[[1]], data.list[-1])
-DefaultAssay(data) = "integrated"
-# DefaultAssay(data) = "RNA"
-# data = FindVariableFeatures(data)
-data = ScaleData(data)
-data = RunPCA(data, npcs = 50)
-p = ElbowPlot(data, ndims = 50, reduction = "pca")
+p = ElbowPlot(data, ndims = 20, reduction = "pca")
 ggsave("tmp/elbowplot.png", p)
-# data = JackStraw(data, num.replicate = 100, dims = 50)
-# data <- ScoreJackStraw(data, dims = 1:50)
-# p = JackStrawPlot(data, dims = 1:50)
-# ggsave("tmp/jackstrawplot.png", p)
-# p = DimHeatmap(data, dims = 1:10, cells = 500, balanced = TRUE)
-# ggsave("tmp/heatmap.png", p, width = 14, height = 14)
-#data = RunHarmony(data, reduction = "pca", group.by.vars = "orig.ident", assay.use = "RNA")
-data = RunUMAP(data, reduction = "pca", dims = 1:10)
-data = RunTSNE(data, reduction = "pca", dims = 1:10)
-data = FindNeighbors(data, reduction = "pca", dims = 1:10)
+data = RunUMAP(data, reduction = "harmony", dims = 1:8, n.neighbors = 50L)
+data = RunTSNE(data, reduction = "harmony", dims = 1:8)
+data = FindNeighbors(data, reduction = "harmony", dims = 1:8, k.param = 110)
 data = FindClusters(data, resolution = 1:15/10)
-p = DimPlot(data, group.by = "orig.ident", reduction = "tsne", split.by = "orig.ident", ncol = 3)
-ggsave("tmp/tsne.sample.png", p, width = 10, height = 15)
-p = clustree(data, prefix = "integrated_snn_res.")
-ggsave("tmp/clustree.png", p, height = 10, width = 10)
-Idents(data) = "integrated_snn_res.0.6"
+p = DimPlot(data, group.by = "orig.ident", reduction = "umap", raster=FALSE)
+ggsave("tmp/tsne.sample.png", p)
+p = clustree(data, prefix = "RNA_snn_res.")
+ggsave("tmp/clustree.png", p, height = 10, width = 18)
+Idents(data) = "RNA_snn_res.0.2"
 data$cluster = Idents(data)
-p = DimPlot(data, group.by = "cluster", reduction = "tsne", label = TRUE)
+p = DimPlot(data, group.by = "cluster", reduction = "umap", label = TRUE)
 ggsave("tmp/tsne.cluster.png", p)
 
 ###### group infomation #####
@@ -125,7 +124,7 @@ data$group = group$Group[match(data$orig.ident, group$Sample)]
 ###### DE of cluster #####
 DefaultAssay(data) = "RNA"
 library(future)
-plan("multiprocess", workers = 8)
+plan("multiprocess", workers = 20)
 options(future.globals.maxSize = 1500 * 1024^2)
 Idents(data) = "cluster"
 deg = FindAllMarkers(data)
@@ -158,46 +157,27 @@ sce = as.SingleCellExperiment(data)
 pred <- SingleR(sce, ref=ref, assay.type.test=1, labels=ref$label.fine, method = "cluster",
                 BPPARAM=MulticoreParam(8))
 data$celltype_singler=pred$labels
-p = DimPlot(data, group.by = "celltype_singler", reduction = "tsne")
+p = DimPlot(data, group.by = "celltype_singler", reduction = "umap", label = TRUE)
 ggsave("tmp/tsne.celltype.png", p)
 
 Idents(data) = data$cluster
 data = RenameIdents(data,
                     "0" = "Stage II neutrophil",
-                    "1" = "Stage II neutrophil",
-                    "2" = "Monocyte",
-                    "3" = "B Cell",
-                    "4" = "Stage I neutrophil",
-                    "5" = "Stage II neutrophil",
-                    "6" = "NKT",
-                    "7" = "Stage II neutrophil",
-                    "8" = "B Cell",
-                    "9" = "Stage I neutrophil",
-                    "10" = "NK",
-                    "11" = "T Cell",
-                    "12" = "Stage I neutrophil",
-                    "13" = "T Cell",
-                    "14" = "T Cell",
-                    "15" = "NKT",
-                    "16" = "T Cell",
-                    "17" = "Monocyte-dendritic cell",
-                    "18" = "Stage I neutrophil",
-                    "19" = "Monocyte",
-                    "20" = "B Cell",
-                    "21" = "T Cell",
-                    "22" = "T Cell",
-                    "23" = "NKT",
-                    "24" = "Stage II neutrophil",
-                    "25" = "DC",
-                    "26" = "T Cell",
-                    "27" = "Monocyte",
-                    "28" = "Macrophage",
-                    "29" = "Monocyte",
-                    "30" = "T Cell",
-                    "31" = "Stem cell")
+                    "1" = "Stage I neutrophil",
+                    "2" = "T Cell",
+                    "3" = "Monocyte",
+                    "4" = "B Cell",
+                    "5" = "NKT",
+                    "6" = "NK",
+                    "7" = "Monocyte",
+                    "8" = "Stage I neutrophil",
+                    "9" = "B Cell")
 data$celltype = Idents(data)
 p = DimPlot(data, group.by = "celltype", label = TRUE, repel = TRUE,label.box = TRUE, reduction = "umap") + NoLegend()
 ggsave("tmp/tsne.celltype.png", p)
+
+p = DimPlot(data, group.by = "group", reduction = "umap")
+ggsave("tmp/tsne.group.png", p)
 
 ###### boxplot #####
 library(cowplot)
@@ -206,7 +186,7 @@ colnames(df) <- c('times','cluster','celltype','nUMI')
 p = ggplot(df,aes(x=celltype,y=nUMI)) + 
   geom_boxplot() + coord_flip() +
   xlab("Celltypes") + ylab("nUMI") + scale_fill_discrete(guide=FALSE) +
-#  scale_y_continuous(expand=c(0,0),limits=c(0,17000),breaks=c(0,5000,10000,15000),labels=c('0','5000','10000','>=15000')) + 
+  #  scale_y_continuous(expand=c(0,0),limits=c(0,17000),breaks=c(0,5000,10000,15000),labels=c('0','5000','10000','>=15000')) + 
   theme_cowplot()
 bout = file.path(out, "Stat_of_per_cluster")
 if (!dir.exists(bout)) dir.create(bout)
@@ -215,7 +195,7 @@ ggsave(file.path(bout, "boxplot_of_per_celltype.pdf"),p,bg="white")
 p = ggplot(df,aes(x=cluster,y=nUMI)) + 
   geom_boxplot() + coord_flip() +
   xlab("Clusters") + ylab("nUMI") + scale_fill_discrete(guide=FALSE) +
-#  scale_y_continuous(expand=c(0,0),limits=c(0,17000),breaks=c(0,5000,10000,15000),labels=c('0','5000','10000','>=15000')) + 
+  #  scale_y_continuous(expand=c(0,0),limits=c(0,17000),breaks=c(0,5000,10000,15000),labels=c('0','5000','10000','>=15000')) + 
   theme_cowplot()
 ggsave(file.path(bout, "boxplot_of_per_cluster.png"),p,bg="white")
 ggsave(file.path(bout, "boxplot_of_per_cluster.pdf"),p,bg="white")
@@ -264,23 +244,6 @@ for (name in unique(subdeg$cluster)){
     ggsave(file.path(subout, paste("vln", gene, "pdf", sep = ".")), p, height = 4, bg = "white")
   }
 }
-
-###### marker plot #####
-mout = file.path(out, "Marker_Plot")
-if (!dir.exists(mout)) dir.create(mout)
-levels = "3, 8, 20, 25, 28, 2, 19, 27, 29, 17, 10, 6, 15, 23, 11, 13, 14, 16, 21, 22, 26, 30, 4, 9, 12, 18, 0, 1, 5, 7, 24, 31"
-levels = unlist(strsplit(levels, ", "))
-data$cluster = factor(data$cluster, levels = levels)
-markers = "Cd79a, Cd79b, Igkc, Cd74, H2-Aa, H2-Ab1, H2-Eb1, C1qa, Apoe, Vcam1, C1qb, Lyz2, F13a1, Ms4a6c, Ccr2, S100a4, Klf4, Ctss, Csf1r, Cx3cr1, Ccl5, Gzma, Nkg7, Cd3d, Cd3g, Cd3e, Trbc2, Ltf, Ngp, Camp, Lcn2, Ifitm6, Cd177, Anxa1, Adpgk, Ly6g, Syne1, Dstn, Stfa2l1, Il1b, Ifitm1, Tmem176a, Tmem176b, Ly6a"
-markers = unlist(strsplit(markers, ", "))
-#markers = unique(markers)
-p = DotPlot(data, assay = "RNA", group.by = "cluster", features = rev(markers)) + coord_flip()
-ggsave(file.path(mout, "dotplot.png"), p, bg = "white", height = 10, width = 10)
-ggsave(file.path(mout, "dotplot.pdf"), p, bg = "white", height = 10, width = 10)
-p = StackedVlnPlot(data, assay = "RNA", group.by = "cluster", features = markers, 
-                   color.use = c(ggsci::pal_simpsons()(16), ggsci::pal_igv()(50)))
-ggsave(file.path(mout, "stackedvlnplot.png"), p, bg = "white", height = 10)
-ggsave(file.path(mout, "stackedvlnplot.pdf"), p, bg = "white", height = 10)
 
 ###### Monocyte stat #####
 msout = file.path(out, "Monocyte_stat")
@@ -412,87 +375,87 @@ Idents(mdata) = "group"
 geneSet = getGmt("/mnt/beegfs/Research/Database/MSigDB/c5.go.v7.5.1.symbols.gmt")
 get_GO_data = getFromNamespace("get_GO_data", "clusterProfiler")
 for(source in c("BL", "BM")){
-    if (source == "BL"){
-      samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
-      ident.1 = "A-2"
-      ident.2 = "A-1"
-    }else{
-      samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
-      ident.1 = "B-2"
-      ident.2 = "B-1"
-    }
-    subout = file.path(eout, source)
-    goout = file.path(subout, "GO")
-    gsvaout = file.path(subout, "GSAV")
-    if (!dir.exists(subout)) dir.create(subout)
-    if (!dir.exists(goout)) dir.create(goout)
-    if (!dir.exists(gsvaout)) dir.create(gsvaout)
-    sub = subset(mdata, orig.ident %in% samples)
-    compare_list = combn(as.character(unique(sub$group)), 2, simplify = FALSE)
-    deg = FindMarkers(sub, ident.1 = ident.1, ident.2 = ident.2)
-    #deg = deg %>% filter(avg_log2FC > 0.5, p_val_adj < 0.01)
-    write.csv(deg, file.path(subout, paste("DEG", source, "csv", sep = ".")), row.names = T, quote = F)
-    genes = rownames(deg)
-    eg <- bitr(genes, fromType="SYMBOL", toType=c("ENTREZID","ENSEMBL"), OrgDb='org.Mm.eg.db')
-    BP_go <- enrichGO(gene = unique(eg$ENTREZID),keyType = "ENTREZID",OrgDb = 'org.Mm.eg.db',ont="BP",pvalueCutoff = 0.05,readable = TRUE)
-    MF_go <- enrichGO(gene = unique(eg$ENTREZID),keyType = "ENTREZID",OrgDb = 'org.Mm.eg.db',ont="MF",pvalueCutoff = 0.05,readable = TRUE)
-    CC_go <- enrichGO(gene = unique(eg$ENTREZID),keyType = "ENTREZID",OrgDb = 'org.Mm.eg.db',ont="CC",pvalueCutoff = 0.05,readable = TRUE)
-    bp <- as.data.frame(BP_go)
-    cc <- as.data.frame(CC_go)
-    mf <- as.data.frame(MF_go)
-    write.csv(bp, file.path(goout, paste("GO", "BP", "csv", sep = ".")), row.names = F, quote = F)
-    write.csv(cc, file.path(goout, paste("GO", "CC", "csv", sep = ".")), row.names = F, quote = F)
-    write.csv(mf, file.path(goout, paste("GO", "MF", "csv", sep = ".")), row.names = F, quote = F)
-    
-    ## go_list
-    bp = subset(bp, Count > 2)
-    cc = subset(cc, Count > 2)
-    mf = subset(mf, Count > 2)
-    bpterms <- bp$ID
-    ccterms <- cc$ID
-    mfterms <- mf$ID
-    go_list = c()
-    if (length(bpterms) != 0){
-      BP_GO <- get_GO_data("org.Mm.eg.db", "BP", "SYMBOL")
-      bp_list <- BP_GO$PATHID2EXTID[bpterms]
-      names(bp_list) <- paste(names(BP_GO$PATHID2NAME[bpterms]), "BP",BP_GO$PATHID2NAME[bpterms],sep=':')
-      go_list = c(go_list, bp_list)
-    }
-    if (length(ccterms) != 0){
-      CC_GO <- get_GO_data("org.Mm.eg.db", "CC", "SYMBOL") 
-      cc_list <- CC_GO$PATHID2EXTID[ccterms]
-      names(cc_list) <-  paste(names(CC_GO$PATHID2NAME[ccterms]), "CC",CC_GO$PATHID2NAME[ccterms],sep=":")
-      go_list = c(go_list, bp_list)
-    }
-    if (length(mfterms) != 0){
-      MF_GO <- get_GO_data("org.Mm.eg.db", "MF", "SYMBOL")
-      mf_list <- MF_GO$PATHID2EXTID[mfterms]
-      names(mf_list) <-  paste(names(MF_GO$PATHID2NAME[mfterms]), "MF",MF_GO$PATHID2NAME[mfterms],sep=":")
-      go_list = c(go_list, bp_list)
-    }
-    
-    ## GSVA
-    exp = GetAssayData(sub, assay = "RNA", slot = "data")
-    gsva_result = gsva(as.matrix(exp), method = "gsva", kcdf = "Gaussian", mx.diff=T, gset.idx.list=go_list, parallel.sz=10)
-    if (source == "BL"){
-      group <- factor(sub$group,levels = c("A-2", "A-1"))
-      design <- model.matrix(~0+group)
-      colnames(design) = c("A2", "A1")
-      compare = makeContrasts("A2", "A1", levels = design)
-      colnames(compare) = c("A-2", "A-1")
-      rownames(compare) = c("A-2", "A-1")
-      colnames(design) = c("A-2", "A-1")
-    }else{
-      group <- factor(sub$group,levels = c("B-2", "B-1"))
-      design <- model.matrix(~0+group)
-      colnames(design) = c("B2", "B1")
-      compare = makeContrasts("B2", "B1", levels = design)
-      colnames(compare) = c("B-2", "B-1")
-      rownames(compare) = c("B-2", "B-1")
-      colnames(design) = c("B-2", "B-1")
-    }
-    gsva_de(gsva_result, design, compare, source, gsvaout)
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    ident.1 = "A-2"
+    ident.2 = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    ident.1 = "B-2"
+    ident.2 = "B-1"
   }
+  subout = file.path(eout, source)
+  goout = file.path(subout, "GO")
+  gsvaout = file.path(subout, "GSAV")
+  if (!dir.exists(subout)) dir.create(subout)
+  if (!dir.exists(goout)) dir.create(goout)
+  if (!dir.exists(gsvaout)) dir.create(gsvaout)
+  sub = subset(mdata, orig.ident %in% samples)
+  compare_list = combn(as.character(unique(sub$group)), 2, simplify = FALSE)
+  deg = FindMarkers(sub, ident.1 = ident.1, ident.2 = ident.2, test.use = "DESeq2")
+  #deg = deg %>% filter(avg_log2FC > 0.5, p_val_adj < 0.01)
+  write.csv(deg, file.path(subout, paste("DEG", source, "csv", sep = ".")), row.names = T, quote = F)
+  genes = rownames(deg)
+  eg <- bitr(genes, fromType="SYMBOL", toType=c("ENTREZID","ENSEMBL"), OrgDb='org.Mm.eg.db')
+  BP_go <- enrichGO(gene = unique(eg$ENTREZID),keyType = "ENTREZID",OrgDb = 'org.Mm.eg.db',ont="BP",pvalueCutoff = 0.05,readable = TRUE)
+  MF_go <- enrichGO(gene = unique(eg$ENTREZID),keyType = "ENTREZID",OrgDb = 'org.Mm.eg.db',ont="MF",pvalueCutoff = 0.05,readable = TRUE)
+  CC_go <- enrichGO(gene = unique(eg$ENTREZID),keyType = "ENTREZID",OrgDb = 'org.Mm.eg.db',ont="CC",pvalueCutoff = 0.05,readable = TRUE)
+  bp <- as.data.frame(BP_go)
+  cc <- as.data.frame(CC_go)
+  mf <- as.data.frame(MF_go)
+  write.csv(bp, file.path(goout, paste("GO", "BP", "csv", sep = ".")), row.names = F, quote = F)
+  write.csv(cc, file.path(goout, paste("GO", "CC", "csv", sep = ".")), row.names = F, quote = F)
+  write.csv(mf, file.path(goout, paste("GO", "MF", "csv", sep = ".")), row.names = F, quote = F)
+  
+  ## go_list
+  bp = subset(bp, Count > 2)
+  cc = subset(cc, Count > 2)
+  mf = subset(mf, Count > 2)
+  bpterms <- bp$ID
+  ccterms <- cc$ID
+  mfterms <- mf$ID
+  go_list = c()
+  if (length(bpterms) != 0){
+    BP_GO <- get_GO_data("org.Mm.eg.db", "BP", "SYMBOL")
+    bp_list <- BP_GO$PATHID2EXTID[bpterms]
+    names(bp_list) <- paste(names(BP_GO$PATHID2NAME[bpterms]), "BP",BP_GO$PATHID2NAME[bpterms],sep=':')
+    go_list = c(go_list, bp_list)
+  }
+  if (length(ccterms) != 0){
+    CC_GO <- get_GO_data("org.Mm.eg.db", "CC", "SYMBOL") 
+    cc_list <- CC_GO$PATHID2EXTID[ccterms]
+    names(cc_list) <-  paste(names(CC_GO$PATHID2NAME[ccterms]), "CC",CC_GO$PATHID2NAME[ccterms],sep=":")
+    go_list = c(go_list, bp_list)
+  }
+  if (length(mfterms) != 0){
+    MF_GO <- get_GO_data("org.Mm.eg.db", "MF", "SYMBOL")
+    mf_list <- MF_GO$PATHID2EXTID[mfterms]
+    names(mf_list) <-  paste(names(MF_GO$PATHID2NAME[mfterms]), "MF",MF_GO$PATHID2NAME[mfterms],sep=":")
+    go_list = c(go_list, bp_list)
+  }
+  
+  ## GSVA
+  exp = GetAssayData(sub, assay = "RNA", slot = "data")
+  gsva_result = gsva(as.matrix(exp), method = "gsva", kcdf = "Gaussian", mx.diff=T, gset.idx.list=go_list, parallel.sz=10)
+  if (source == "BL"){
+    group <- factor(sub$group,levels = c("A-2", "A-1"))
+    design <- model.matrix(~0+group)
+    colnames(design) = c("A2", "A1")
+    compare = makeContrasts("A2", "A1", levels = design)
+    colnames(compare) = c("A-2", "A-1")
+    rownames(compare) = c("A-2", "A-1")
+    colnames(design) = c("A-2", "A-1")
+  }else{
+    group <- factor(sub$group,levels = c("B-2", "B-1"))
+    design <- model.matrix(~0+group)
+    colnames(design) = c("B2", "B1")
+    compare = makeContrasts("B2", "B1", levels = design)
+    colnames(compare) = c("B-2", "B-1")
+    rownames(compare) = c("B-2", "B-1")
+    colnames(design) = c("B-2", "B-1")
+  }
+  gsva_de(gsva_result, design, compare, source, gsvaout)
+}
 
 ###### Monocyte Ly6C2#####
 lout = file.path(out,"Ly6c2_anlysis")
@@ -602,3 +565,475 @@ for(source in c("BL", "BM")){
     ggsave(file.path(subout, paste0("vln.", gene, ".pdf")), vln, bg = "white")
   })
 }
+
+
+vout = file.path(out, "Gene_vln")
+if (!dir.exists(vout)) dir.create(vout)
+egenes = c()
+for (gene in genes){
+  if (gene %in% rownames(mdata)){
+    p = VlnPlot(mdata, features = gene, pt.size = 0, group.by = "orig.ident")
+    ggsave(file.path(vout, paste("vln", gene, "png", sep = ".")), p)
+    ggsave(file.path(vout, paste("vln", gene, "pdf", sep = ".")), p)
+  }else{
+    egenes = c(egenes, gene)
+  }
+}
+
+##### 其他 ####
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(mdata, orig.ident %in% samples)
+  Idents(sub) = "orig.ident"
+  p = StackedVlnPlot(sub, features = gene)
+  ggsave(file.path("result-2022-07-12", paste("stackedvlnplot", source, "png", sep = ".")), p, height = 10, width = 5)
+  ggsave(file.path("result-2022-07-12", paste("stackedvlnplot", source, "pdf", sep = ".")), p, height = 7, width = 2)
+  
+  subout = file.path("result-2022-07-12",  "Repair_gene_vln")
+  if (!dir.exists(subout)) dir.create(subout)
+  lapply(gene, function(g){
+    g = str_to_title(g)
+    pt.size = AutoPointSize(sub)
+    vln = VlnPlot(sub, features = g, group.by = "group", slot = "data")
+    df = vln$data
+    df$ident = ifelse(df$ident == case, "MI", "Sham")
+    vln = ggplot(df, aes_string("ident", g, fill = "ident")) + geom_violin(trim = TRUE, scale = "width")
+    vln = vln + geom_jitter(height = 0, size = pt.size, show.legend = FALSE)
+    vln = vln + theme_cowplot() + theme(plot.title = element_text(hjust = 0.5))
+    vln = vln + xlab("Group") + ylab("Expression Level") + labs(title = g) + NoLegend()
+    vln = vln + stat_compare_means(
+      comparisons = list(c("MI", "Sham")), method = "wilcox.test", 
+      symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+                         symbols = c("****", "***", "**", "*", "ns")))
+    ggsave(file.path(subout, paste0(source, g, ".png")), vln, bg = "white", width = 2, height = 4)
+    ggsave(file.path(subout, paste0(source, g, ".pdf")), vln, bg = "white", width = 2, height = 4)
+  })
+}
+
+hout= file.path(out, "heatmap")
+if (!dir.exists(hout)) dir.create(hout)
+library(pheatmap)
+for (source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(mdata, orig.ident %in% samples)
+  DefaultAssay(sub) = "RNA"
+  # df = AverageExpression(sub, vars = gene, slot = "data", group.by = "orig.ident")
+  Idents(sub) = "group"
+  df = lapply(samples, function(x){
+    sample_data = subset(sub, orig.ident == x)
+    Idents(sample_data) = "group"
+    subdeg = FindMarkers(sample_data, ident.1 = case, ident.2 = control, logfc.threshold = 0)
+    subdeg = subdeg[rownames(subdeg) %in% gene,]
+    subdeg = subdeg %>% select(avg_log2FC)
+    colnames(subdeg) = x
+  })
+  df = do.call(cbind, df)
+  p = pheatmap(df, cellwidth = 20, cellheight = 20, cluster_row = FALSE, 
+               display_numbers = matrix(ifelse(df > 0.1, ifelse(df > 0.25, "**", "*"), ""), nrow(df)))
+  ggsave(file.path(hout, paste("heatmap", source, "png", sep = ".")), p)
+}
+
+
+##### 2022-07-14 ######
+out = "/mnt/beegfs/Research/Users/yangyupeng/scRNA/KY202205250064/2022-07-04/03.seurat/KY202205250064/result-2022-07-14"
+if (!dir.exists(out)) dir.create(out)
+uout = file.path(out, "UMAP")
+if (!dir.exists(uout)) dir.create(uout)
+p = DimPlot(data, group.by = "celltype", label = TRUE, repel = TRUE,label.box = TRUE, reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.celltype.png"), p, width = 9)
+ggsave(file.path(uout, "umap.celltype.pdf"), p, width = 9)
+p = DimPlot(data, group.by = "cluster", label = TRUE, repel = TRUE,label.box = TRUE, reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.cluster.png"), p, width = 9)
+ggsave(file.path(uout, "umap.cluster.pdf"), p, width = 9)
+p = DimPlot(data, group.by = "orig.ident", label = TRUE, repel = TRUE,label.box = TRUE, reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.sample.png"), p, width = 9)
+ggsave(file.path(uout, "umap.sample.pdf"), p, width = 9)
+
+p = DimPlot(mdata, group.by = "cluster", label = TRUE, repel = TRUE,label.box = TRUE, reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.Monocyte_cluster.png"), p, width = 9)
+ggsave(file.path(uout, "umap.Monocyte_cluster.pdf"), p, width = 9)
+p = DimPlot(mdata, group.by = "celltype", label = TRUE, repel = TRUE,label.box = TRUE, reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.Monocyte_celltype.png"), p, width = 9)
+ggsave(file.path(uout, "umap.Monocyte_celltype.pdf"), p, width = 9)
+p = DimPlot(mdata, group.by = "orig.ident", reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.Monocyte_sample.png"), p, width = 9)
+ggsave(file.path(uout, "umap.Monocyte_sample.pdf"), p, width = 9)
+
+mout = file.path(out, "Marker_Plot")
+if (!dir.exists(mout)) dir.create(mout)
+levels = "4, 9, 3, 7, 6, 5, 2, 1, 8, 0"
+levels = unlist(strsplit(levels, ", "))
+data$cluster = factor(data$cluster, levels = levels)
+markers = "Cd74, Cd79a, Cd79b, Igkc, Csf1r, Ctsc, Ctss, S100a4, Ms4a6c, Gzma, Klra8, Ncr1, Klrd1, Ccl5, Nkg7, Cd3d, Cd3g, Cd3e, Trbc2, Ltf, Ngp, Camp, Lcn2, Ifitm6, Cd177, Anxa1, Adpgk, Ly6g, Syne1, Dstn, Stfa2l1, Il1b, Ifitm1"
+markers = unlist(strsplit(markers, ", "))
+p = DotPlot(data, assay = "RNA", group.by = "cluster", features = rev(markers)) + coord_flip()
+ggsave(file.path(mout, "dotplot.png"), p, bg = "white", height = 10, width = 10)
+ggsave(file.path(mout, "dotplot.pdf"), p, bg = "white", height = 10, width = 10)
+p = StackedVlnPlot(data, assay = "RNA", group.by = "cluster", features = markers, 
+                   color.use = c(ggsci::pal_simpsons()(16), ggsci::pal_igv()(50)))
+ggsave(file.path(mout, "stackedvlnplot.png"), p, bg = "white", height = 10)
+ggsave(file.path(mout, "stackedvlnplot.pdf"), p, bg = "white", height = 10)
+
+DefaultAssay(data) = "RNA"
+library(future)
+plan("multiprocess", workers = 20)
+options(future.globals.maxSize = 1500 * 1024^2)
+Idents(data) = "cluster"
+deg = FindAllMarkers(data, )
+deout = file.path(out, "DEG")
+if (!dir.exists(deout)) dir.create(deout)
+write.csv(deg, file.path(deout, "DEG.cluster.csv"), row.names = F, quote = F)
+#top 20 vlnplot
+vout = file.path(deout, "DEG_cluster_top20")
+if (!dir.exists(vout)) dir.create(vout)
+subdeg = deg %>% group_by(cluster) %>% top_n(20, wt=avg_log2FC)
+for (name in unique(subdeg$cluster)){
+  subout = file.path(vout, name)
+  if (!dir.exists(subout)) dir.create(subout)
+  genes = subdeg %>% filter(cluster == name) %>% .$gene
+  for (gene in genes){
+    p = VlnPlot(data, features = gene, group.by = "cluster", pt.size = 0) + NoLegend()
+    ggsave(file.path(subout, paste("vln", gene, "png", sep = ".")), p, height = 4, bg = "white")
+    ggsave(file.path(subout, paste("vln", gene, "pdf", sep = ".")), p, height = 4, bg = "white")
+  }
+}
+
+Idents(data) = "celltype"
+deg = FindAllMarkers(data)
+if (!dir.exists(deout)) dir.create(deout)
+write.csv(deg, file.path(deout, "DEG.celltype.csv"), row.names = F, quote = F)
+#top 10 vlnplot
+vout = file.path(deout, "DEG_celltype_top10")
+if (!dir.exists(vout)) dir.create(vout)
+subdeg = deg %>% group_by(cluster) %>% top_n(10, wt=avg_log2FC)
+for (name in unique(subdeg$cluster)){
+  subout = file.path(vout, name)
+  if (!dir.exists(subout)) dir.create(subout)
+  genes = subdeg %>% filter(cluster == name) %>% .$gene
+  for (gene in genes){
+    p = VlnPlot(data, features = gene, group.by = "celltype", pt.size = 0) + NoLegend()
+    ggsave(file.path(subout, paste("vln", gene, "png", sep = ".")), p, height = 4, bg = "white")
+    ggsave(file.path(subout, paste("vln", gene, "pdf", sep = ".")), p, height = 4, bg = "white")
+  }
+}
+
+library(ggpubr)
+library(stringr)
+mrout = file.path(out, "Monocyte_repair_gene")
+if (!dir.exists(mrout)) dir.create(mrout)
+##Tgfb改成Tgfb1
+genes = "Cdkn1a, Fosl2, Isg15, Kmt2c, Krit1, Myh9, Ncl, Nr4a1, Phip, Pim1, Prkx, Rnf213, Stat3, Syk, Tnfaip3, Wasf2, SOD1, YWHAZ"
+genes = unlist(strsplit(genes, ", "))
+DefaultAssay(data) = "RNA"
+# mdata = subset(data, celltype == "Monocyte")
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(mdata, orig.ident %in% samples)
+  subout = file.path(mrout, source)
+  if (!dir.exists(subout)) dir.create(subout)
+  lapply(genes, function(gene){
+    gene = str_to_title(gene)
+    pt.size = AutoPointSize(sub)
+    vln = VlnPlot(sub, features = gene, group.by = "group", slot = "data")
+    df = vln$data
+    df$ident = ifelse(df$ident == case, "MI", "Sham")
+    df$ident = factor(df$ident, levels = c("Sham", "MI"))
+    compare_list = combn(as.character(unique(df$ident)), 2, simplify = FALSE)
+    vln = ggplot(df, aes_string("ident", gene, fill = "ident")) + geom_violin(trim = TRUE, scale = "width")
+    vln = vln + geom_jitter(height = 0, size = pt.size, show.legend = FALSE)
+    vln = vln + theme_cowplot() + theme(plot.title = element_text(hjust = 0.5))
+    vln = vln + xlab("Identity") + ylab("Expression Level") + labs(title = gene) + NoLegend()
+    vln = vln + stat_compare_means(
+      comparisons = compare_list, method = "wilcox.test", 
+      symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+                         symbols = c("****", "***", "**", "*", "ns")))
+    ggsave(file.path(subout, paste0("vln.", gene, ".png")), vln, bg = "white", width = 3)
+    ggsave(file.path(subout, paste0("vln.", gene, ".pdf")), vln, bg = "white", width = 3)
+  })
+}
+
+lout = file.path(out,"Ly6c2_anlysis")
+if (!dir.exists(lout)) dir.create(lout)
+DefaultAssay(mdata) = "RNA"
+exp = mdata@assays$RNA@counts["Ly6c2",]
+mdata$Ly6c2 = ifelse(exp > 0, "Ly6c2+", "Ly6c2-")
+mdata$Ly6c2 = factor(mdata$Ly6c2, levels = c("Ly6c2+", "Ly6c2-"))
+p = DimPlot(mdata, group.by = "Ly6c2", split.by = "Ly6c2", label = TRUE, label.box = TRUE)
+ggsave(file.path(lout, "umap.Ly6c2.png"), p, width = 14)
+ggsave(file.path(lout, "umap.Ly6c2.pdf"), p, width = 14)
+p = DimPlot(mdata, group.by = "orig.ident", split.by = "Ly6c2")
+ggsave(file.path(lout, "umap.sample.png"), p, width = 14)
+ggsave(file.path(lout, "umap.sample.pdf"), p, width = 14)
+p = DimPlot(mdata, group.by = "cluster", split.by = "Ly6c2", label = TRUE, label.box = TRUE)
+ggsave(file.path(lout, "umap.cluster.png"), p, width = 14)
+ggsave(file.path(lout, "umap.cluster.pdf"), p, width = 14)
+p = DimPlot(mdata, group.by = "celltype", split.by = "Ly6c2", label = TRUE, label.box = TRUE)
+ggsave(file.path(lout, "umap.celltype.png"), p, width = 14)
+ggsave(file.path(lout, "umap.celltype.pdf"), p, width = 14)
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(mdata, orig.ident %in% samples)
+  subout = file.path(lout, source)
+  if (!dir.exists(subout)) dir.create(subout)
+  lapply(genes, function(gene){
+    gene = str_to_title(gene)
+    pt.size = AutoPointSize(sub)
+    vln = VlnPlot(sub, features = gene, group.by = "group", slot = "data", split.by = "Ly6c2")
+    df = vln$data
+    df$ident = ifelse(df$ident == case, "MI", "Sham")
+    df$ident = factor(df$ident, levels = c("Sham", "MI"))
+    compare_list = combn(as.character(unique(df$ident)), 2, simplify = FALSE)
+    vln = ggplot(df, aes_string("ident", gene, fill = "ident")) + geom_violin(trim = TRUE, scale = "width")
+    vln = vln + geom_jitter(height = 0, size = pt.size, show.legend = FALSE)
+    vln = vln + theme_cowplot() + theme(plot.title = element_text(hjust = 0.5)) + facet_wrap(~split)
+    vln = vln + xlab("Identity") + ylab("Expression Level") + labs(title = gene) + NoLegend()
+    vln = vln + stat_compare_means(
+      comparisons = compare_list, method = "wilcox.test", 
+      symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+                         symbols = c("****", "***", "**", "*", "ns")))
+    ggsave(file.path(subout, paste0("vln.", gene, ".png")), vln, bg = "white", width = 7)
+    ggsave(file.path(subout, paste0("vln.", gene, ".pdf")), vln, bg = "white", width = 7)
+  })
+}
+
+eout = file.path(out, "Group_de")
+if (!dir.exists(eout)) dir.create(eout)
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    ident.1 = "A-2"
+    ident.2 = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    ident.1 = "B-2"
+    ident.2 = "B-1"
+  }
+  subout = file.path(eout, source)
+  if (!dir.exists(subout)) dir.create(subout)
+  sub = subset(mdata, orig.ident %in% samples)
+  compare_list = combn(as.character(unique(sub$group)), 2, simplify = FALSE)
+  Idents(sub) = "group"
+  deg = FindMarkers(sub, ident.1 = ident.1, ident.2 = ident.2, logfc.threshold = 0)
+  deg = deg %>% filter(p_val_adj < 0.05)
+  write.csv(deg, file.path(subout, paste("DEG", source, "csv", sep = ".")), row.names = T, quote = F)
+}
+
+eout = file.path(out, "Ly6c2_group_de")
+if (!dir.exists(eout)) dir.create(eout)
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    ident.1 = "A-2"
+    ident.2 = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    ident.1 = "B-2"
+    ident.2 = "B-1"
+  }
+  subout = file.path(eout, source)
+  if (!dir.exists(subout)) dir.create(subout)
+  sub = subset(mdata, orig.ident %in% samples)
+  compare_list = combn(as.character(unique(sub$group)), 2, simplify = FALSE)
+  sub1 = subset(mdata, Ly6c2 == "Ly6c2+")
+  Idents(sub1) = "group"
+  deg = FindMarkers(sub1, ident.1 = ident.1, ident.2 = ident.2, logfc.threshold = 0)
+  deg = deg %>% filter(p_val_adj < 0.05)
+  write.csv(deg, file.path(subout, paste("DEG", source, "Ly6c2+", "csv", sep = ".")), row.names = T, quote = F)
+  sub2 = subset(mdata, Ly6c2 == "Ly6c2-")
+  Idents(sub2) = "group"
+  deg = FindMarkers(sub2, ident.1 = ident.1, ident.2 = ident.2, logfc.threshold = 0)
+  deg = deg %>% filter(p_val_adj < 0.05)
+  write.csv(deg, file.path(subout, paste("DEG", source, "Ly6c2-", "csv", sep = ".")), row.names = T, quote = F)
+}
+
+###### 新的修复基因 #####
+out = "/mnt/beegfs/Research/Users/yangyupeng/scRNA/KY202205250064/2022-07-04/03.seurat/KY202205250064/result-2022-07-16"
+mrout = file.path(out, "Monocyte_repair_gene")
+if (!dir.exists(out)) dir.create(out)
+if (!dir.exists(mrout)) dir.create(mrout)
+genes = "AGO2, BCL2L11, BTG1, CCL5, CD274, CD74, CDKN1A, CFLAR, CXCL10, CYBB, DHX9, FLNA, FOSL2, FOXP1, GRK2, HGF, IL1B, ITGB1, ITGB2, ITPKB, KMT2C, KRIT1, LILRA5, MAPK14, MYH9, NFE2L2, PDE3B, PHIP, PML, PRKX, PTEN, PTGS2, RB1, RUNX1, SOD1, STAT3, SYK, TNFRSF1A, VEZF1, WAPL, WASF2, YWHAZ, ZMIZ1"
+genes = unlist(strsplit(genes, ", "))
+# mdata = subset(data, celltype == "Monocyte")
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(mdata, orig.ident %in% samples)
+  subout = file.path(mrout, source)
+  if (!dir.exists(subout)) dir.create(subout)
+  lapply(genes, function(gene){
+    gene = str_to_title(gene)
+    pt.size = AutoPointSize(sub)
+    vln = VlnPlot(sub, features = gene, group.by = "group", slot = "data")
+    df = vln$data
+    df$ident = ifelse(df$ident == case, "MI", "Sham")
+    df$ident = factor(df$ident, levels = c("Sham", "MI"))
+    compare_list = combn(as.character(unique(df$ident)), 2, simplify = FALSE)
+    vln = ggplot(df, aes_string("ident", gene, fill = "ident")) + geom_violin(trim = TRUE, scale = "width")
+    vln = vln + geom_jitter(height = 0, size = pt.size, show.legend = FALSE)
+    vln = vln + theme_cowplot() + theme(plot.title = element_text(hjust = 0.5))
+    vln = vln + xlab("Identity") + ylab("Expression Level") + labs(title = gene) + NoLegend()
+    vln = vln + stat_compare_means(
+      comparisons = compare_list, method = "wilcox.test", 
+      symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+                         symbols = c("****", "***", "**", "*", "ns")))
+    ggsave(file.path(subout, paste0("vln.", gene, ".png")), vln, bg = "white", width = 3)
+    ggsave(file.path(subout, paste0("vln.", gene, ".pdf")), vln, bg = "white", width = 3)
+  })
+}
+
+lout = file.path(out, "Ly6C2_repair_gene")
+if (!dir.exists(lout)) dir.create(lout)
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(mdata, orig.ident %in% samples)
+  subout = file.path(lout, source)
+  if (!dir.exists(subout)) dir.create(subout)
+  lapply(genes, function(gene){
+    gene = str_to_title(gene)
+    pt.size = AutoPointSize(sub)
+    vln = VlnPlot(sub, features = gene, group.by = "group", slot = "data", split.by = "Ly6c2")
+    df = vln$data
+    df$ident = ifelse(df$ident == case, "MI", "Sham")
+    df$ident = factor(df$ident, levels = c("Sham", "MI"))
+    compare_list = combn(as.character(unique(df$ident)), 2, simplify = FALSE)
+    vln = ggplot(df, aes_string("ident", gene, fill = "ident")) + geom_violin(trim = TRUE, scale = "width")
+    vln = vln + geom_jitter(height = 0, size = pt.size, show.legend = FALSE)
+    vln = vln + theme_cowplot() + theme(plot.title = element_text(hjust = 0.5)) + facet_wrap(~split)
+    vln = vln + xlab("Identity") + ylab("Expression Level") + labs(title = gene) + NoLegend()
+    vln = vln + stat_compare_means(
+      comparisons = compare_list, method = "wilcox.test", 
+      symnum.args = list(cutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1), 
+                         symbols = c("****", "***", "**", "*", "ns")))
+    ggsave(file.path(subout, paste0("vln.", gene, ".png")), vln, bg = "white", width = 7)
+    ggsave(file.path(subout, paste0("vln.", gene, ".pdf")), vln, bg = "white", width = 7)
+  })
+}
+
+##qc图##
+qcout = file.path(out, "QC")
+if (!dir.exists(qcout)) dir.create(qcout)
+p = VlnPlot(data, features = c("nFeature_RNA")) + labs("nGene") + NoLegend()
+ggsave(file.path(qcout, "vlnplot.nGene.png"), p)
+ggsave(file.path(qcout, "vlnplot.nGene.pdf"), p)
+p = VlnPlot(data, features = c("nCount_RNA")) + labs("nUMI") + NoLegend()
+ggsave(file.path(qcout, "vlnplot.nUMI.png"), p)
+ggsave(file.path(qcout, "vlnplot.nUMI.pdf"), p)
+p = VlnPlot(data, features = c("percent.mt")) + NoLegend()
+ggsave(file.path(qcout, "vlnplot.mt.png"), p)
+ggsave(file.path(qcout, "vlnplot.mt.pdf"), p)
+for(source in c("BL", "BM")){
+  if (source == "BL"){
+    samples = c("BL01","BL02","BL03","BL04","BL05","BL06")
+    case = "A-2"
+    control = "A-1"
+  }else{
+    samples = c("BM01","BM02","BM03","BM04","BM05","BM06")
+    case = "B-2"
+    control = "B-1"
+  }
+  sub = subset(data, orig.ident %in% samples)
+  sub$group = ifelse(sub$group == case, "MI", "Sham")
+  sub$group = factor(sub$group, levels = c("Sham", "MI"))
+  p = VlnPlot(sub, features = c("nFeature_RNA"), group.by = "group") + labs("nGene") + NoLegend()
+  ggsave(file.path(qcout, "vlnplot.nGene_by_group.png"), p, width = 3)
+  ggsave(file.path(qcout, "vlnplot.nGene_by_group.pdf"), p, width = 3)
+  p = VlnPlot(sub, features = c("nCount_RNA"), group.by = "group") + labs("nUMI") + NoLegend()
+  ggsave(file.path(qcout, "vlnplot.nUMI_by_group.png"), p, width = 3)
+  ggsave(file.path(qcout, "vlnplot.nUMI_by_group.pdf"), p, width = 3)
+  p = VlnPlot(sub, features = c("percent.mt"), group.by = "group") + NoLegend()
+  ggsave(file.path(qcout, "vlnplot.mt_by_group.png"), p, width = 3)
+  ggsave(file.path(qcout, "vlnplot.mt_by_group.pdf"), p, width = 3)
+}
+
+## boxplot ##
+library(cowplot)
+df <- data.frame(data$orig.ident,data$cluster,data$celltype,data$nCount_RNA)
+colnames(df) <- c('times','cluster','celltype','nUMI')
+p = ggplot(df,aes(x=celltype,y=nUMI)) + 
+  geom_boxplot() + coord_flip() +
+  xlab("Celltypes") + ylab("nUMI") + scale_fill_discrete(guide=FALSE) +
+  #  scale_y_continuous(expand=c(0,0),limits=c(0,17000),breaks=c(0,5000,10000,15000),labels=c('0','5000','10000','>=15000')) + 
+  theme_cowplot()
+bout = file.path(out, "Stat_of_per_cluster")
+if (!dir.exists(bout)) dir.create(bout)
+ggsave(file.path(bout, "boxplot_of_per_celltype.png"),p,bg="white")
+ggsave(file.path(bout, "boxplot_of_per_celltype.pdf"),p,bg="white")
+p = ggplot(df,aes(x=cluster,y=nUMI)) + 
+  geom_boxplot() + coord_flip() +
+  xlab("Clusters") + ylab("nUMI") + scale_fill_discrete(guide=FALSE) +
+  #  scale_y_continuous(expand=c(0,0),limits=c(0,17000),breaks=c(0,5000,10000,15000),labels=c('0','5000','10000','>=15000')) + 
+  theme_cowplot()
+ggsave(file.path(bout, "boxplot_of_per_cluster.png"),p,bg="white")
+ggsave(file.path(bout, "boxplot_of_per_cluster.pdf"),p,bg="white")
+
+## 单核细胞的颜色和总的uamp相同 ##
+library(scales)
+uout = file.path(out, "UMAP")
+if (!dir.exists(uout)) dir.create(uout)
+p = DimPlot(mdata, group.by = "cluster", reduction = "umap", raster=FALSE) +
+  scale_color_manual(values = hue_pal()(9)[c(4, 8)])
+ggsave(file.path(uout, "umap.Monocyte_cluster.png"), p, width = 9)
+ggsave(file.path(uout, "umap.Monocyte_cluster.pdf"), p, width = 9)
+p = DimPlot(mdata, group.by = "celltype", reduction = "umap", raster=FALSE) +
+  scale_color_manual(values = hue_pal()(7)[4])
+ggsave(file.path(uout, "umap.Monocyte_celltype.png"), p, width = 9)
+ggsave(file.path(uout, "umap.Monocyte_celltype.pdf"), p, width = 9)
+p = DimPlot(mdata, group.by = "orig.ident", reduction = "umap", raster=FALSE)
+ggsave(file.path(uout, "umap.Monocyte_sample.png"), p, width = 9)
+ggsave(file.path(uout, "umap.Monocyte_sample.pdf"), p, width = 9)
+
+## celltype stat ##
+sout = file.path(out, "Celltype_stat")
+if (!dir.exists(sout)) dir.create(sout)
+tb = table(data$celltype, data$orig.ident)
+tatol = rowSums(tb)
+tb = cbind(Celltype = rownames(tb), tb, Total = tatol)
+tb = as.data.frame(tb)
+write.csv(tb, file.path(sout, "celltype_stat.csv"), row.names = F, quote = F)
